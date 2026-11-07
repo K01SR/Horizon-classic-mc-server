@@ -82,3 +82,51 @@ pub fn serverbound(state: State) -> &'static [Option<u8>] {
         State::Play => PLAY_SERVERBOUND,
     }
 }
+
+/// Maps a 26.3 clientbound packet id to a 26.2 clientbound packet id.
+pub fn clientbound_26_3_to_26_2(state: State, id: i32) -> Option<i32> {
+    let table = clientbound(state);
+    let u = u8::try_from(id).ok()?;
+    table.iter().position(|&v| v == Some(u)).map(|pos| pos as i32)
+}
+
+/// Maps a 26.2 serverbound packet id to a 26.3 serverbound packet id.
+pub fn serverbound_26_2_to_26_3(state: State, id: i32) -> Option<i32> {
+    let table = serverbound(state);
+    let u = u8::try_from(id).ok()?;
+    table.iter().position(|&v| v == Some(u)).map(|pos| pos as i32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_clientbound_26_3_to_26_2() {
+        // Configuration: update_enabled_features is 13 in 26.3, 12 in 26.2
+        assert_eq!(clientbound_26_3_to_26_2(State::Configuration, 13), Some(12));
+        // Configuration: update_tags is 14 in 26.3, 13 in 26.2
+        assert_eq!(clientbound_26_3_to_26_2(State::Configuration, 14), Some(13));
+        // Configuration: select_known_packs is 15 in 26.3, 14 in 26.2
+        assert_eq!(clientbound_26_3_to_26_2(State::Configuration, 15), Some(14));
+        // Play: login is 50 in 26.3, 49 in 26.2
+        assert_eq!(clientbound_26_3_to_26_2(State::Play, 50), Some(49));
+        // Play: add_transient_block (37 in 26.3) is new in 26.3, so None
+        assert_eq!(clientbound_26_3_to_26_2(State::Play, 37), None);
+        // Play: projectile_power (83 in 26.3) is new in 26.3, so None
+        assert_eq!(clientbound_26_3_to_26_2(State::Play, 83), None);
+        // Play: set_movement_speed (123 in 26.3) is new in 26.3, so None
+        assert_eq!(clientbound_26_3_to_26_2(State::Play, 123), None);
+    }
+
+    #[test]
+    fn test_serverbound_26_2_to_26_3() {
+        // Play: resource_pack is 49 in 26.2, 50 in 26.3
+        assert_eq!(serverbound_26_2_to_26_3(State::Play, 49), Some(50));
+        // Play: keep_alive is identical
+        assert_eq!(serverbound_26_2_to_26_3(State::Play, 28), Some(28));
+        // Play: set_structure_block (61 in 26.2 -> 62 in 26.3)
+        assert_eq!(serverbound_26_2_to_26_3(State::Play, 61), Some(62));
+    }
+}
+

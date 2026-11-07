@@ -243,6 +243,7 @@ pub struct PlayerSender {
     pub pending: Arc<AtomicUsize>,
     held: Arc<Mutex<Vec<Vec<u8>>>>,
     to: To,
+    pub is_26_2: bool,
 }
 #[derive(Clone)]
 enum To {
@@ -258,6 +259,7 @@ impl PlayerSender {
             pending,
             held: Arc::default(),
             to: To::Channel(tx),
+            is_26_2: false,
         }
     }
     /// Whether the client has answered no keep-alive for too long.
@@ -274,6 +276,14 @@ impl PlayerSender {
         self.held.lock().unwrap_or_else(PoisonError::into_inner)
     }
     pub fn send(&self, body: Vec<u8>) {
+        let body = if self.is_26_2 {
+            match adapt_play_clientbound(&body) {
+                Some(b) => b,
+                None => return,
+            }
+        } else {
+            body
+        };
         self.pending.fetch_add(body.len(), Ordering::Relaxed);
         if HOLDING.get() {
             self.held().push(body);
@@ -294,6 +304,14 @@ impl PlayerSender {
         }
         let mut held = self.held();
         for body in bodies {
+            let body = if self.is_26_2 {
+                match adapt_play_clientbound(&body) {
+                    Some(b) => b,
+                    None => continue,
+                }
+            } else {
+                body
+            };
             self.pending.fetch_add(body.len(), Ordering::Relaxed);
             held.push(body);
         }
@@ -315,7 +333,12 @@ impl PlayerSender {
         match &self.to {
             To::Channel(tx) => drop(tx.send(Out::Disconnect(reason))),
             To::Pool(outbox, _) => {
-                let body = play::Clientbound::Disconnect(cfg::Disconnect { reason }).encode();
+                let mut body = play::Clientbound::Disconnect(cfg::Disconnect { reason }).encode();
+                if self.is_26_2 {
+                    if let Some(adapted) = adapt_play_clientbound(&body) {
+                        body = adapted;
+                    }
+                }
                 self.pending.fetch_add(body.len(), Ordering::Relaxed);
                 outbox.send(vec![body], Some(io_pool::End::Disconnect));
             }
@@ -475,7 +498,7 @@ fn serve_connection(
         // ServerHandshakePacketListenerImpl: a server that does not reply
         // to status requests closes the connection.
         handshake::STATUS if !shared.enable_status() => Ok(()),
-        handshake::STATUS => serve_status(&mut c, &shared),
+        handshake::STATUS => serve_status(&mut c, &shared, intention.protocol),
         handshake::TRANSFER if !shared.accepts_transfers() => {
             login_disconnect(
                 &mut c,
@@ -484,7 +507,8 @@ fn serve_connection(
             Ok(())
         }
         handshake::LOGIN | handshake::TRANSFER => {
-            if intention.protocol != PROTOCOL_VERSION {
+            // Accept both 26.3 (777) and 26.2 (776) clients.
+            if intention.protocol != PROTOCOL_VERSION && intention.protocol != 776 {
                 let key = if intention.protocol < 754 {
                     "multiplayer.disconnect.outdated_client"
                 } else {
@@ -500,13 +524,13 @@ fn serve_connection(
                 );
                 return Ok(());
             }
-            serve_login(c, address, &shared, counted)
+            serve_login(c, address, &shared, counted, intention.protocol)
         }
         other => Err(format!("unknown intent {other}")),
     }
 }
 
-fn serve_status(c: &mut Connection, shared: &Shared) -> Result<(), String> {
+fn serve_status(c: &mut Connection, shared: &Shared, client_protocol: i32) -> Result<(), String> {
     let e = |e: horizon_protocol::Error| e.to_string();
     let mut requested = false;
     loop {
@@ -516,7 +540,7 @@ fn serve_status(c: &mut Connection, shared: &Shared) -> Result<(), String> {
             status::Serverbound::StatusRequest(_) if requested => return Ok(()),
             status::Serverbound::StatusRequest(_) => {
                 requested = true;
-                let json = shared.status_json();
+                let json = shared.status_json_for(client_protocol);
                 c.send(
                     &status::Clientbound::StatusResponse(status::StatusResponse { json }).encode(),
                 )
@@ -676,6 +700,7 @@ fn serve_login(
     address: std::net::SocketAddr,
     shared: &Arc<Shared>,
     counted: Option<super::Counted>,
+    client_protocol: i32,
 ) -> Result<(), String> {
     let e = |e: horizon_protocol::Error| e.to_string();
     let (id, payload) = c.recv().map_err(e)?;
@@ -792,10 +817,10 @@ fn serve_login(
             );
         }
     };
-    let result = login_and_configure(&mut c, shared, uuid, &name, properties);
+    let result = login_and_configure(&mut c, shared, uuid, &name, properties, client_protocol);
     match result {
         Ok(Some(parts)) => {
-            play(c, shared, parts, address, counted, expected.is_some());
+            play(c, shared, parts, address, counted, expected.is_some(), client_protocol);
             Ok(())
         }
         Ok(None) => {
@@ -858,6 +883,7 @@ fn login_and_configure(
     uuid: u128,
     name: &str,
     properties: Vec<login::Property>,
+    client_protocol: i32,
 ) -> Result<Option<Parts>, String> {
     let e = |e: horizon_protocol::Error| e.to_string();
     // ServerLoginPacketListenerImpl: memory connections are not compressed.
@@ -892,7 +918,30 @@ fn login_and_configure(
     // Configuration.
     let sync_data = shared.sync();
     let sync: &SyncData = &sync_data;
-    let send = |c: &mut Connection, p: cfg::Clientbound| c.send(&p.encode()).map_err(e);
+    let is_26_2 = client_protocol == 776;
+    let send = |c: &mut Connection, p: cfg::Clientbound| {
+        let body = p.encode();
+        if is_26_2 {
+            // Remap 26.3 configuration clientbound packet IDs to 26.2 IDs.
+            use horizon_protocol::adapter::v26_2;
+            let mut r = horizon_protocol::buf::Reader::new(&body);
+            if let Ok(id) = r.varint() {
+                let payload = r.rest();
+                if let Some(mapped) = v26_2::clientbound_26_3_to_26_2(
+                    horizon_protocol::State::Configuration,
+                    id,
+                ) {
+                    let mut out = Vec::with_capacity(body.len() + 1);
+                    horizon_protocol::buf::write_varint(&mut out, mapped);
+                    out.extend_from_slice(payload);
+                    return c.send(&out).map_err(e);
+                }
+                // Packet doesn't exist in 26.2 (e.g. post_effects), skip it.
+                return Ok(());
+            }
+        }
+        c.send(&body).map_err(e)
+    };
     send(
         c,
         cfg::Clientbound::CustomPayload(cfg::CustomPayload {
@@ -922,10 +971,11 @@ fn login_and_configure(
             features: sync.features.clone(),
         }),
     )?;
+    let is_26_2 = client_protocol == 776 || shared.is_version_26_2();
     let core = KnownPack {
         namespace: CORE_PACK.0.into(),
         id: CORE_PACK.1.into(),
-        version: CORE_PACK.2.into(),
+        version: if is_26_2 { "26.2".into() } else { CORE_PACK.2.into() },
     };
     send(
         c,
@@ -1251,6 +1301,7 @@ fn play(
     address: std::net::SocketAddr,
     counted: Option<super::Counted>,
     expected: bool,
+    client_protocol: i32,
 ) {
     shared.entered_play();
     let conn = shared.next_id();
@@ -1268,10 +1319,12 @@ fn play(
         start: Instant::now(),
         alive: Arc::new(AtomicI64::new(-1)),
     });
+    let is_26_2 = client_protocol == 776 || shared.is_version_26_2();
     let sender = PlayerSender {
-        pending,
+        pending: pending.clone(),
         held: Arc::default(),
         to: To::Pool(outbox.clone(), watch.clone()),
+        is_26_2,
     };
     let required_pack = shared
         .config
@@ -1290,6 +1343,7 @@ fn play(
         next_keep_alive: watch.start + KEEP_ALIVE_EVERY,
         watch,
         counted,
+        is_26_2,
     };
     let joined = Joined {
         conn,
@@ -1333,20 +1387,38 @@ struct PlayConn {
     next_keep_alive: Instant,
     /// The connection's place among the server's, given back once closed.
     counted: Option<super::Counted>,
+    is_26_2: bool,
 }
 impl io_pool::Session for PlayConn {
     /// Forward the player's packet, or say why it ends the connection: a
     /// required resource pack declined, a rate-limit excess, a malformed packet.
     fn packet(&mut self, id: i32, payload: Vec<u8>) -> io_pool::Verdict {
         use io_pool::Verdict;
+        let is_26_2 = self.is_26_2;
         let kick = |(reason, text): (horizon_world::nbt::Tag, String)| {
-            let body = play::Clientbound::Disconnect(cfg::Disconnect { reason }).encode();
+            let mut body = play::Clientbound::Disconnect(cfg::Disconnect { reason }).encode();
+            if is_26_2 {
+                if let Some(adapted) = adapt_play_clientbound(&body) {
+                    body = adapted;
+                }
+            }
             Verdict::Kick(text, body)
         };
         let now = Instant::now();
         if let Some(average) = self.rate.as_mut().and_then(|r| r.received(now)) {
             return kick(rate_exceeded(&self.shared, average));
         }
+        let id = if self.is_26_2 {
+            match horizon_protocol::adapter::v26_2::serverbound_26_2_to_26_3(
+                horizon_protocol::State::Play,
+                id,
+            ) {
+                Some(mapped) => mapped,
+                None => return io_pool::Verdict::Go,
+            }
+        } else {
+            id
+        };
         match play::Serverbound::decode(id, &payload).and_then(checked_play) {
             Ok(play::Serverbound::KeepAlive(k)) => {
                 self.watch.alive.store(k.id, Ordering::Relaxed);
@@ -1386,7 +1458,13 @@ impl io_pool::Session for PlayConn {
         let id = i64::try_from(self.watch.start.elapsed().as_millis()).unwrap_or(0);
         self.sent_at = Some((id, now));
         self.next_keep_alive = now + KEEP_ALIVE_EVERY;
-        Some(play::Clientbound::KeepAlive(cfg::KeepAlive { id }).encode())
+        let mut body = play::Clientbound::KeepAlive(cfg::KeepAlive { id }).encode();
+        if self.is_26_2 {
+            if let Some(adapted) = adapt_play_clientbound(&body) {
+                body = adapted;
+            }
+        }
+        Some(body)
     }
     fn left(&mut self, reason: String) {
         let _ = self.shared.events.send(NetEvent::Left(self.conn, reason));
@@ -1397,6 +1475,22 @@ impl io_pool::Session for PlayConn {
         self.shared.release(self.uuid);
         self.counted = None;
     }
+}
+
+/// Remaps a 26.3 clientbound play packet body to 26.2.
+pub(super) fn adapt_play_clientbound(body: &[u8]) -> Option<Vec<u8>> {
+    use horizon_protocol::{State, adapter::v26_2, buf::{Reader, write_varint}};
+    let mut r = Reader::new(body);
+    let id = r.varint().ok()?;
+    let payload = r.rest();
+    let mapped = v26_2::clientbound_26_3_to_26_2(State::Play, id)?;
+    if mapped == id {
+        return Some(body.to_vec());
+    }
+    let mut out = Vec::with_capacity(body.len() + 1);
+    write_varint(&mut out, mapped);
+    out.extend_from_slice(payload);
+    Some(out)
 }
 
 /// RateKickingConnection: the packets a second a connection averages, as

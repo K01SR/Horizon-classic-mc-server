@@ -476,10 +476,25 @@ impl Shared {
             .wrapping_add(1_442_695_040_888_963_407);
         ((*r >> 33) as usize) % bound.max(1)
     }
+    /// Whether this server is configured for Minecraft 26.2.
+    pub fn is_version_26_2(&self) -> bool {
+        if let Ok(meta) = std::fs::read_to_string("meta.json") {
+            if meta.contains("26.2") {
+                return true;
+            }
+        }
+        false
+    }
+
     /// The status response (MinecraftServer.buildServerStatus encoded with
     /// ServerStatus.CODEC): description, players with up to 12 shuffled
     /// names, version, favicon and enforcesSecureChat when true.
     pub fn status_json(&self) -> String {
+        self.status_json_for(PROTOCOL_VERSION)
+    }
+
+    /// The status response customized for a client requesting `client_protocol`.
+    pub fn status_json_for(&self, client_protocol: i32) -> String {
         use crate::server::json::Json;
         let motd = self.motd.lock().unwrap().clone();
         let online: Vec<(u128, String)> = self.online.lock().unwrap().clone();
@@ -514,16 +529,21 @@ impl Shared {
                 ),
             ));
         }
+        let (ver_name, ver_proto) = if client_protocol == 776 || self.is_version_26_2() {
+            ("26.2", 776)
+        } else {
+            (GAME_VERSION, PROTOCOL_VERSION)
+        };
         let mut status = vec![
             ("description".to_owned(), Json::String(motd)),
             ("players".to_owned(), Json::Object(players)),
             (
                 "version".to_owned(),
                 Json::Object(vec![
-                    ("name".to_owned(), Json::String(GAME_VERSION.to_owned())),
+                    ("name".to_owned(), Json::String(ver_name.to_owned())),
                     (
                         "protocol".to_owned(),
-                        Json::Number(PROTOCOL_VERSION.to_string()),
+                        Json::Number(ver_proto.to_string()),
                     ),
                 ]),
             ),
